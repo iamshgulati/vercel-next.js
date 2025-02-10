@@ -2,7 +2,9 @@
 import { NextRequest, NextResponse, URLPattern } from 'next/server'
 import magicValue from 'shared-package'
 
-export const config = { regions: 'auto' }
+export const config = {
+  regions: 'auto',
+}
 
 const PATTERNS = [
   [
@@ -116,7 +118,18 @@ export async function middleware(request) {
   }
 
   if (url.pathname === '/global') {
-    return serializeData(JSON.stringify({ process: { env: process.env } }))
+    return serializeData(
+      JSON.stringify({
+        process: {
+          env: {
+            ANOTHER_MIDDLEWARE_TEST: process.env.ANOTHER_MIDDLEWARE_TEST,
+            STRING_ENV_VAR: process.env.STRING_ENV_VAR,
+            MIDDLEWARE_TEST: process.env.MIDDLEWARE_TEST,
+            NEXT_RUNTIME: process.env.NEXT_RUNTIME,
+          },
+        },
+      })
+    )
   }
 
   if (url.pathname.endsWith('/globalthis')) {

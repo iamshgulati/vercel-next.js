@@ -1,103 +1,55 @@
-import { StackFrame } from 'next/dist/compiled/stacktrace-parser'
-// import type { OriginalStackFrameResponse } from '../../middleware'
+import type { StackFrame } from 'next/dist/compiled/stacktrace-parser'
+import type {
+  OriginalStackFrameResponse,
+  OriginalStackFrameResponseResult,
+  OriginalStackFramesRequest,
+} from '../../server/shared'
+import {
+  isWebpackInternalResource,
+  formatFrameSourceFile,
+} from './webpack-module-path'
+export interface OriginalStackFrame extends OriginalStackFrameResponse {
+  error: boolean
+  reason: string | null
+  external: boolean
+  ignored: boolean
+  sourceStackFrame: StackFrame
+}
 
-export type OriginalStackFrame =
-  | {
-      error: true
-      reason: string
-      external: false
-      expanded: false
-      sourceStackFrame: StackFrame
-      originalStackFrame: null
-      originalCodeFrame: null
-      sourcePackage?: string
-    }
-  | {
-      error: false
-      reason: null
-      external: false
-      expanded: boolean
-      sourceStackFrame: StackFrame
-      originalStackFrame: StackFrame
-      originalCodeFrame: string | null
-      sourcePackage?: string
-    }
-  | {
-      error: false
-      reason: null
-      external: true
-      expanded: false
-      sourceStackFrame: StackFrame
-      originalStackFrame: null
-      originalCodeFrame: null
-      sourcePackage?: string
-    }
-
-export function getOriginalStackFrame(
+function getOriginalStackFrame(
   source: StackFrame,
-  type: 'server' | 'edge-server' | null,
-  errorMessage: string
+  response: OriginalStackFrameResponseResult
 ): Promise<OriginalStackFrame> {
   async function _getOriginalStackFrame(): Promise<OriginalStackFrame> {
-    const params = new URLSearchParams()
-    params.append('isServer', String(type === 'server'))
-    params.append('isEdgeServer', String(type === 'edge-server'))
-    params.append('isAppDirectory', 'true')
-    params.append('errorMessage', errorMessage)
-    for (const key in source) {
-      params.append(key, ((source as any)[key] ?? '').toString())
+    if (response.status === 'rejected') {
+      return Promise.reject(new Error(response.reason))
     }
 
-    const controller = new AbortController()
-    const tm = setTimeout(() => controller.abort(), 3000)
-    const res = await self
-      .fetch(
-        `${
-          process.env.__NEXT_ROUTER_BASEPATH || ''
-        }/__nextjs_original-stack-frame?${params.toString()}`,
-        {
-          signal: controller.signal,
-        }
-      )
-      .finally(() => {
-        clearTimeout(tm)
-      })
-    if (!res.ok || res.status === 204) {
-      return Promise.reject(new Error(await res.text()))
-    }
+    const body: OriginalStackFrameResponse = response.value
 
-    const body: /* OriginalStackFrameResponse */ any = await res.json()
     return {
       error: false,
       reason: null,
       external: false,
-      expanded: !Boolean(
-        /* collapsed */
-        (source.file?.includes('node_modules') ||
-          body.originalStackFrame?.file?.includes('node_modules')) ??
-          true
-      ),
       sourceStackFrame: source,
       originalStackFrame: body.originalStackFrame,
       originalCodeFrame: body.originalCodeFrame || null,
       sourcePackage: body.sourcePackage,
+      ignored: body.originalStackFrame?.ignored || false,
     }
   }
 
-  if (
-    !(
-      source.file?.startsWith('webpack-internal:') ||
-      source.file?.startsWith('file:')
-    )
-  ) {
+  // TODO: merge this section into ignoredList handling
+  if (source.file === 'file://' || source.file?.match(/https?:\/\//)) {
     return Promise.resolve({
       error: false,
       reason: null,
       external: true,
-      expanded: false,
       sourceStackFrame: source,
       originalStackFrame: null,
       originalCodeFrame: null,
+      sourcePackage: null,
+      ignored: true,
     })
   }
 
@@ -105,56 +57,94 @@ export function getOriginalStackFrame(
     error: true,
     reason: err?.message ?? err?.toString() ?? 'Unknown Error',
     external: false,
-    expanded: false,
     sourceStackFrame: source,
     originalStackFrame: null,
     originalCodeFrame: null,
+    sourcePackage: null,
+    ignored: false,
   }))
 }
 
-export function getOriginalStackFrames(
+export async function getOriginalStackFrames(
   frames: StackFrame[],
   type: 'server' | 'edge-server' | null,
-  errorMessage: string
-) {
+  isAppDir: boolean
+): Promise<OriginalStackFrame[]> {
+  const req: OriginalStackFramesRequest = {
+    frames,
+    isServer: type === 'server',
+    isEdgeServer: type === 'edge-server',
+    isAppDirectory: isAppDir,
+  }
+
+  const res = await fetch('/__nextjs_original-stack-frames', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  })
+
+  // When fails to fetch the original stack frames, we reject here to be
+  // caught at `_getOriginalStackFrame()` and return the stack frames so
+  // that the error overlay can render.
+  if (!res.ok || res.status === 204) {
+    const reason = await res.text()
+    return Promise.all(
+      frames.map((frame) =>
+        getOriginalStackFrame(frame, {
+          status: 'rejected',
+          reason: `Failed to fetch the original stack frames: ${reason}`,
+        })
+      )
+    )
+  }
+
+  const data = await res.json()
   return Promise.all(
-    frames.map((frame) => getOriginalStackFrame(frame, type, errorMessage))
+    frames.map((frame, index) => getOriginalStackFrame(frame, data[index]))
   )
 }
 
 export function getFrameSource(frame: StackFrame): string {
-  let str = ''
-  try {
-    const u = new URL(frame.file!)
+  if (!frame.file) return ''
 
-    // Strip the origin for same-origin scripts.
-    if (
-      typeof globalThis !== 'undefined' &&
-      globalThis.location?.origin !== u.origin
-    ) {
-      // URLs can be valid without an `origin`, so long as they have a
-      // `protocol`. However, `origin` is preferred.
-      if (u.origin === 'null') {
-        str += u.protocol
+  const isWebpackFrame = isWebpackInternalResource(frame.file)
+
+  let str = ''
+  // Skip URL parsing for webpack internal file paths.
+  if (isWebpackFrame) {
+    str = formatFrameSourceFile(frame.file)
+  } else {
+    try {
+      const u = new URL(frame.file)
+
+      let parsedPath = ''
+      // Strip the origin for same-origin scripts.
+      if (globalThis.location?.origin !== u.origin) {
+        // URLs can be valid without an `origin`, so long as they have a
+        // `protocol`. However, `origin` is preferred.
+        if (u.origin === 'null') {
+          parsedPath += u.protocol
+        } else {
+          parsedPath += u.origin
+        }
+      }
+
+      // Strip query string information as it's typically too verbose to be
+      // meaningful.
+      parsedPath += u.pathname
+      str = formatFrameSourceFile(parsedPath)
+    } catch {
+      str = formatFrameSourceFile(frame.file)
+    }
+  }
+
+  if (!isWebpackInternalResource(frame.file) && frame.lineNumber != null) {
+    if (str) {
+      if (frame.column != null) {
+        str += ` (${frame.lineNumber}:${frame.column})`
       } else {
-        str += u.origin
+        str += ` (${frame.lineNumber})`
       }
     }
-
-    // Strip query string information as it's typically too verbose to be
-    // meaningful.
-    str += u.pathname
-    str += ' '
-  } catch {
-    str += (frame.file || '(unknown)') + ' '
   }
-
-  if (frame.lineNumber != null) {
-    if (frame.column != null) {
-      str += `(${frame.lineNumber}:${frame.column}) `
-    } else {
-      str += `(${frame.lineNumber}) `
-    }
-  }
-  return str.slice(0, -1)
+  return str
 }
