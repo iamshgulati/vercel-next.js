@@ -1,5 +1,6 @@
-import { TelemetryPlugin } from '../../build/webpack/plugins/telemetry-plugin'
-import type { SWC_TARGET_TRIPLE } from '../../build/webpack/plugins/telemetry-plugin'
+import type { TelemetryPlugin } from '../../build/webpack/plugins/telemetry-plugin/telemetry-plugin'
+import type { SWC_TARGET_TRIPLE } from '../../build/webpack/plugins/telemetry-plugin/telemetry-plugin'
+import type { UseCacheTrackerKey } from '../../build/webpack/plugins/telemetry-plugin/use-cache-tracker-utils'
 
 const REGEXP_DIRECTORY_DUNDER =
   /[\\/]__[^\\/]+(?<![\\/]__(?:tests|mocks))__[\\/]/i
@@ -152,11 +153,11 @@ export type EventBuildFeatureUsage = {
     | '@next/font/local'
     | 'next/font/google'
     | 'next/font/local'
-    | 'experimental/optimizeCss'
     | 'experimental/nextScriptWorkers'
-    | 'optimizeFonts'
+    | 'experimental/dynamicIO'
+    | 'experimental/optimizeCss'
+    | 'experimental/ppr'
     | 'swcLoader'
-    | 'swcMinify'
     | 'swcRelay'
     | 'swcStyledComponents'
     | 'swcReactRemoveProperties'
@@ -172,12 +173,15 @@ export type EventBuildFeatureUsage = {
     | 'skipMiddlewareUrlNormalize'
     | 'skipTrailingSlashRedirect'
     | 'modularizeImports'
+    | 'esmExternals'
+    | 'webpackPlugins'
+    | UseCacheTrackerKey
   invocationCount: number
 }
 export function eventBuildFeatureUsage(
-  telemetryPlugin: TelemetryPlugin
+  usages: ReturnType<TelemetryPlugin['usages']>
 ): Array<{ eventName: string; payload: EventBuildFeatureUsage }> {
-  return telemetryPlugin.usages().map(({ featureName, invocationCount }) => ({
+  return usages.map(({ featureName, invocationCount }) => ({
     eventName: EVENT_BUILD_FEATURE_USAGE,
     payload: {
       featureName,
@@ -194,9 +198,11 @@ export type EventPackageUsedInGetServerSideProps = {
 }
 
 export function eventPackageUsedInGetServerSideProps(
-  telemetryPlugin: TelemetryPlugin
+  packagesUsedInServerSideProps: ReturnType<
+    TelemetryPlugin['packagesUsedInServerSideProps']
+  >
 ): Array<{ eventName: string; payload: EventPackageUsedInGetServerSideProps }> {
-  return telemetryPlugin.packagesUsedInServerSideProps().map((packageName) => ({
+  return packagesUsedInServerSideProps.map((packageName) => ({
     eventName: EVENT_NAME_PACKAGE_USED_IN_GET_SERVER_SIDE_PROPS,
     payload: {
       package: packageName,

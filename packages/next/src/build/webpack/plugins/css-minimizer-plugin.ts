@@ -1,6 +1,7 @@
 import cssnanoSimple from 'next/dist/compiled/cssnano-simple'
 import postcssScss from 'next/dist/compiled/postcss-scss'
-import postcss, { Parser } from 'postcss'
+import postcss from 'postcss'
+import type { Parser } from 'postcss'
 import { webpack, sources } from 'next/dist/compiled/webpack/webpack'
 import { spans } from './profiling-plugin'
 
@@ -43,7 +44,7 @@ export class CssMinimizerPlugin {
       input = asset.source()
     }
 
-    return postcss([cssnanoSimple({}, postcss)])
+    return postcss([cssnanoSimple({ colormin: false }, postcss)])
       .process(input, postcssOptions)
       .then((res) => {
         if (res.map) {
@@ -67,7 +68,6 @@ export class CssMinimizerPlugin {
           const cssMinimizerSpan = compilationSpan!.traceChild(
             'css-minimizer-plugin'
           )
-          cssMinimizerSpan.setAttribute('webpackVersion', 5)
 
           return cssMinimizerSpan.traceAsyncFn(async () => {
             const files = Object.keys(assets)
@@ -79,10 +79,8 @@ export class CssMinimizerPlugin {
                   assetSpan.setAttribute('file', file)
 
                   return assetSpan.traceAsyncFn(async () => {
-                    const asset = assets[file]
-
-                    const etag = cache.getLazyHashedEtag(asset)
-
+                    const assetSource = compilation.getAsset(file).source
+                    const etag = cache.getLazyHashedEtag(assetSource)
                     const cachedResult = await cache.getPromise(file, etag)
 
                     assetSpan.setAttribute(
@@ -90,13 +88,13 @@ export class CssMinimizerPlugin {
                       cachedResult ? 'HIT' : 'MISS'
                     )
                     if (cachedResult) {
-                      assets[file] = cachedResult
+                      compilation.updateAsset(file, cachedResult)
                       return
                     }
 
-                    const result = await this.optimizeAsset(file, asset)
+                    const result = await this.optimizeAsset(file, assetSource)
                     await cache.storePromise(file, etag, result)
-                    assets[file] = result
+                    compilation.updateAsset(file, result)
                   })
                 })
             )

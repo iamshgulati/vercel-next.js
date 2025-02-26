@@ -25,6 +25,9 @@ import type { webpack } from 'next/dist/compiled/webpack/webpack'
 import type ws from 'next/dist/compiled/ws'
 import { isMiddlewareFilename } from '../../build/utils'
 import type { VersionInfo } from './parse-version-info'
+import type { HMR_ACTION_TYPES } from './hot-reloader-types'
+import { HMR_ACTIONS_SENT_TO_BROWSER } from './hot-reloader-types'
+import { devIndicatorServerState } from './dev-indicator-server-state'
 
 function isMiddlewareStats(stats: webpack.Stats) {
   for (const key of stats.compilation.entrypoints.keys()) {
@@ -70,16 +73,11 @@ class EventStream {
     this.clients = new Set()
   }
 
-  everyClient(fn: (client: ws) => void) {
-    for (const client of this.clients) {
-      fn(client)
-    }
-  }
-
   close() {
-    this.everyClient((client) => {
-      client.close()
-    })
+    for (const wsClient of this.clients) {
+      // it's okay to not cleanly close these websocket connections, this is dev
+      wsClient.terminate()
+    }
     this.clients.clear()
   }
 
@@ -91,9 +89,9 @@ class EventStream {
   }
 
   publish(payload: any) {
-    this.everyClient((client) => {
-      client.send(JSON.stringify(payload))
-    })
+    for (const wsClient of this.clients) {
+      wsClient.send(JSON.stringify(payload))
+    }
   }
 }
 
@@ -104,14 +102,20 @@ export class WebpackHotMiddleware {
   serverLatestStats: { ts: number; stats: webpack.Stats } | null
   closed: boolean
   versionInfo: VersionInfo
+  devtoolsFrontendUrl: string | undefined
 
-  constructor(compilers: webpack.Compiler[], versionInfo: VersionInfo) {
+  constructor(
+    compilers: webpack.Compiler[],
+    versionInfo: VersionInfo,
+    devtoolsFrontendUrl: string | undefined
+  ) {
     this.eventStream = new EventStream()
     this.clientLatestStats = null
     this.middlewareLatestStats = null
     this.serverLatestStats = null
     this.closed = false
     this.versionInfo = versionInfo
+    this.devtoolsFrontendUrl = devtoolsFrontendUrl
 
     compilers[0].hooks.invalid.tap(
       'webpack-hot-middleware',
@@ -132,20 +136,22 @@ export class WebpackHotMiddleware {
 
   onClientInvalid = () => {
     if (this.closed || this.serverLatestStats?.stats.hasErrors()) return
-    this.eventStream.publish({ action: 'building' })
+    this.publish({
+      action: HMR_ACTIONS_SENT_TO_BROWSER.BUILDING,
+    })
   }
 
   onClientDone = (statsResult: webpack.Stats) => {
     this.clientLatestStats = { ts: Date.now(), stats: statsResult }
     if (this.closed || this.serverLatestStats?.stats.hasErrors()) return
-    this.publishStats('built', statsResult)
+    this.publishStats(statsResult)
   }
 
   onServerInvalid = () => {
     if (!this.serverLatestStats?.stats.hasErrors()) return
     this.serverLatestStats = null
     if (this.clientLatestStats?.stats) {
-      this.publishStats('built', this.clientLatestStats.stats)
+      this.publishStats(this.clientLatestStats.stats)
     }
   }
 
@@ -153,7 +159,7 @@ export class WebpackHotMiddleware {
     if (this.closed) return
     if (statsResult.hasErrors()) {
       this.serverLatestStats = { ts: Date.now(), stats: statsResult }
-      this.publishStats('built', statsResult)
+      this.publishStats(statsResult)
     }
   }
 
@@ -161,19 +167,20 @@ export class WebpackHotMiddleware {
     if (!this.middlewareLatestStats?.stats.hasErrors()) return
     this.middlewareLatestStats = null
     if (this.clientLatestStats?.stats) {
-      this.publishStats('built', this.clientLatestStats.stats)
+      this.publishStats(this.clientLatestStats.stats)
     }
   }
 
   onEdgeServerDone = (statsResult: webpack.Stats) => {
     if (!isMiddlewareStats(statsResult)) {
+      this.onServerInvalid()
       this.onServerDone(statsResult)
       return
     }
 
     if (statsResult.hasErrors()) {
       this.middlewareLatestStats = { ts: Date.now(), stats: statsResult }
-      this.publishStats('built', statsResult)
+      this.publishStats(statsResult)
     }
   }
 
@@ -195,20 +202,29 @@ export class WebpackHotMiddleware {
     if (syncStats) {
       const stats = statsToJson(syncStats)
       const middlewareStats = statsToJson(this.middlewareLatestStats?.stats)
-      this.eventStream.publish({
-        action: 'sync',
-        hash: stats.hash,
+
+      if (devIndicatorServerState.disabledUntil < Date.now()) {
+        devIndicatorServerState.disabledUntil = 0
+      }
+
+      this.publish({
+        action: HMR_ACTIONS_SENT_TO_BROWSER.SYNC,
+        hash: stats.hash!,
         errors: [...(stats.errors || []), ...(middlewareStats.errors || [])],
         warnings: [
           ...(stats.warnings || []),
           ...(middlewareStats.warnings || []),
         ],
         versionInfo: this.versionInfo,
+        debug: {
+          devtoolsFrontendUrl: this.devtoolsFrontendUrl,
+        },
+        devIndicator: devIndicatorServerState,
       })
     }
   }
 
-  publishStats = (action: string, statsResult: webpack.Stats) => {
+  publishStats = (statsResult: webpack.Stats) => {
     const stats = statsResult.toJson({
       all: false,
       hash: true,
@@ -217,15 +233,15 @@ export class WebpackHotMiddleware {
       moduleTrace: true,
     })
 
-    this.eventStream.publish({
-      action: action,
-      hash: stats.hash,
+    this.publish({
+      action: HMR_ACTIONS_SENT_TO_BROWSER.BUILT,
+      hash: stats.hash!,
       warnings: stats.warnings || [],
       errors: stats.errors || [],
     })
   }
 
-  publish = (payload: any) => {
+  publish = (payload: HMR_ACTION_TYPES) => {
     if (this.closed) return
     this.eventStream.publish(payload)
   }
