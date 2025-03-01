@@ -8,7 +8,8 @@ import { getNamedMiddlewareRegex } from '../../../shared/lib/router/utils/route-
 import { getModuleBuildInfo } from '../loaders/get-module-build-info'
 import { getSortedRoutes } from '../../../shared/lib/router/utils'
 import { webpack, sources } from 'next/dist/compiled/webpack/webpack'
-import { isMatch } from 'next/dist/compiled/micromatch'
+import picomatch from 'next/dist/compiled/picomatch'
+import path from 'path'
 import {
   EDGE_RUNTIME_WEBPACK,
   EDGE_UNSUPPORTED_NODE_APIS,
@@ -16,31 +17,42 @@ import {
   CLIENT_REFERENCE_MANIFEST,
   MIDDLEWARE_MANIFEST,
   MIDDLEWARE_REACT_LOADABLE_MANIFEST,
-  NEXT_CLIENT_SSR_ENTRY_SUFFIX,
   SUBRESOURCE_INTEGRITY_MANIFEST,
   NEXT_FONT_MANIFEST,
   SERVER_REFERENCE_MANIFEST,
+  INTERCEPTION_ROUTE_REWRITE_MANIFEST,
+  DYNAMIC_CSS_MANIFEST,
 } from '../../../shared/lib/constants'
-import { MiddlewareConfig } from '../../analysis/get-page-static-info'
-import { Telemetry } from '../../../telemetry/storage'
+import type { MiddlewareConfig } from '../../analysis/get-page-static-info'
+import type { Telemetry } from '../../../telemetry/storage'
 import { traceGlobals } from '../../../trace/shared'
 import { EVENT_BUILD_FEATURE_USAGE } from '../../../telemetry/events'
 import { normalizeAppPath } from '../../../shared/lib/router/utils/app-paths'
-import { INSTRUMENTATION_HOOK_FILENAME } from '../../../lib/constants'
-import { NextBuildContext } from '../../build-context'
+import {
+  INSTRUMENTATION_HOOK_FILENAME,
+  WEBPACK_LAYERS,
+} from '../../../lib/constants'
+import type { CustomRoutes } from '../../../lib/load-custom-routes'
+import { isInterceptionRouteRewrite } from '../../../lib/generate-interception-routes-rewrites'
+import { getDynamicCodeEvaluationError } from './wellknown-errors-plugin/parse-dynamic-code-evaluation-error'
+import { getModuleReferencesInOrder } from '../utils'
+
+const KNOWN_SAFE_DYNAMIC_PACKAGES =
+  require('../../../lib/known-edge-safe-packages.json') as string[]
 
 export interface EdgeFunctionDefinition {
   files: string[]
   name: string
   page: string
   matchers: MiddlewareMatcher[]
+  env: Record<string, string>
   wasm?: AssetBinding[]
   assets?: AssetBinding[]
   regions?: string[] | string
 }
 
 export interface MiddlewareManifest {
-  version: 2
+  version: 3
   sortedMiddleware: string[]
   middleware: { [page: string]: EdgeFunctionDefinition }
   functions: { [page: string]: EdgeFunctionDefinition }
@@ -56,6 +68,7 @@ interface EntryMetadata {
 }
 
 const NAME = 'MiddlewarePlugin'
+const MANIFEST_VERSION = 3
 
 /**
  * Checks the value of usingIndirectEval and when it is a set of modules it
@@ -87,15 +100,13 @@ function isUsingIndirectEvalAndUsedByExports(args: {
 function getEntryFiles(
   entryFiles: string[],
   meta: EntryMetadata,
-  opts: {
-    sriEnabled: boolean
-  }
+  hasInstrumentationHook: boolean,
+  opts: Options
 ) {
   const files: string[] = []
   if (meta.edgeSSR) {
     if (meta.edgeSSR.isServerComponent) {
       files.push(`server/${SERVER_REFERENCE_MANIFEST}.js`)
-      files.push(`server/${CLIENT_REFERENCE_MANIFEST}.js`)
       if (opts.sriEnabled) {
         files.push(`server/${SUBRESOURCE_INTEGRITY_MANIFEST}.js`)
       }
@@ -103,26 +114,28 @@ function getEntryFiles(
         ...entryFiles
           .filter(
             (file) =>
-              file.startsWith('pages/') && !file.endsWith('.hot-update.js')
+              file.startsWith('app/') && !file.endsWith('.hot-update.js')
           )
           .map(
             (file) =>
               'server/' +
-              // TODO-APP: seems this should be removed.
-              file.replace('.js', NEXT_CLIENT_SSR_ENTRY_SUFFIX + '.js')
+              file.replace(/\.js$/, '_' + CLIENT_REFERENCE_MANIFEST + '.js')
           )
       )
+    }
+    if (!opts.dev && !meta.edgeSSR.isAppDir) {
+      files.push(`server/${DYNAMIC_CSS_MANIFEST}.js`)
     }
 
     files.push(
       `server/${MIDDLEWARE_BUILD_MANIFEST}.js`,
-      `server/${MIDDLEWARE_REACT_LOADABLE_MANIFEST}.js`
+      `server/${MIDDLEWARE_REACT_LOADABLE_MANIFEST}.js`,
+      `server/${NEXT_FONT_MANIFEST}.js`,
+      `server/${INTERCEPTION_ROUTE_REWRITE_MANIFEST}.js`
     )
-
-    files.push(`server/${NEXT_FONT_MANIFEST}.js`)
   }
 
-  if (NextBuildContext!.hasInstrumentationHook) {
+  if (hasInstrumentationHook) {
     files.push(`server/edge-${INSTRUMENTATION_HOOK_FILENAME}.js`)
   }
 
@@ -131,24 +144,42 @@ function getEntryFiles(
       .filter((file) => !file.endsWith('.hot-update.js'))
       .map((file) => 'server/' + file)
   )
+
   return files
 }
 
 function getCreateAssets(params: {
   compilation: webpack.Compilation
   metadataByEntry: Map<string, EntryMetadata>
-  opts: {
-    sriEnabled: boolean
-  }
+  opts: Options
 }) {
   const { compilation, metadataByEntry, opts } = params
-  return (assets: any) => {
+  return () => {
     const middlewareManifest: MiddlewareManifest = {
-      sortedMiddleware: [],
+      version: MANIFEST_VERSION,
       middleware: {},
       functions: {},
-      version: 2,
+      sortedMiddleware: [],
     }
+
+    const hasInstrumentationHook = compilation.entrypoints.has(
+      INSTRUMENTATION_HOOK_FILENAME
+    )
+
+    // we only emit this entry for the edge runtime since it doesn't have access to a routes manifest
+    // and we don't need to provide the entire route manifest, just the interception routes.
+    const interceptionRewrites = JSON.stringify(
+      opts.rewrites.beforeFiles.filter(isInterceptionRouteRewrite)
+    )
+    compilation.emitAsset(
+      `${INTERCEPTION_ROUTE_REWRITE_MANIFEST}.js`,
+      new sources.RawSource(
+        `self.__INTERCEPTION_ROUTE_REWRITE_MANIFEST=${JSON.stringify(
+          interceptionRewrites
+        )}`
+      ) as unknown as webpack.sources.RawSource
+    )
+
     for (const entrypoint of compilation.entrypoints.values()) {
       if (!entrypoint.name) {
         continue
@@ -180,8 +211,14 @@ function getCreateAssets(params: {
         },
       ]
 
+      const isEdgeFunction = !!(metadata.edgeApiFunction || metadata.edgeSSR)
       const edgeFunctionDefinition: EdgeFunctionDefinition = {
-        files: getEntryFiles(entrypoint.getFiles(), metadata, opts),
+        files: getEntryFiles(
+          entrypoint.getFiles(),
+          metadata,
+          hasInstrumentationHook,
+          opts
+        ),
         name: entrypoint.name,
         page: page,
         matchers,
@@ -193,10 +230,11 @@ function getCreateAssets(params: {
           name,
           filePath,
         })),
+        env: opts.edgeEnvironments,
         ...(metadata.regions && { regions: metadata.regions }),
       }
 
-      if (metadata.edgeApiFunction || metadata.edgeSSR) {
+      if (isEdgeFunction) {
         middlewareManifest.functions[page] = edgeFunctionDefinition
       } else {
         middlewareManifest.middleware[page] = edgeFunctionDefinition
@@ -207,8 +245,11 @@ function getCreateAssets(params: {
       Object.keys(middlewareManifest.middleware)
     )
 
-    assets[MIDDLEWARE_MANIFEST] = new sources.RawSource(
-      JSON.stringify(middlewareManifest, null, 2)
+    compilation.emitAsset(
+      MIDDLEWARE_MANIFEST,
+      new sources.RawSource(
+        JSON.stringify(middlewareManifest, null, 2)
+      ) as unknown as webpack.sources.RawSource
     )
   }
 }
@@ -237,7 +278,8 @@ function buildWebpackError({
 }
 
 function isInMiddlewareLayer(parser: webpack.javascript.JavascriptParser) {
-  return parser.state.module?.layer === 'middleware'
+  const layer = parser.state.module?.layer
+  return layer === WEBPACK_LAYERS.middleware || layer === WEBPACK_LAYERS.api
 }
 
 function isNodeJsModule(moduleName: string) {
@@ -249,8 +291,21 @@ function isDynamicCodeEvaluationAllowed(
   middlewareConfig?: MiddlewareConfig,
   rootDir?: string
 ) {
+  // Some packages are known to use `eval` but are safe to use in the Edge
+  // Runtime because the dynamic code will never be executed.
+  if (
+    KNOWN_SAFE_DYNAMIC_PACKAGES.some((pkg) =>
+      fileName.includes(`/node_modules/${pkg}/`.replace(/\//g, path.sep))
+    )
+  ) {
+    return true
+  }
+
   const name = fileName.replace(rootDir ?? '', '')
-  return isMatch(name, middlewareConfig?.unstable_allowDynamicGlobs ?? [])
+
+  return picomatch(middlewareConfig?.unstable_allowDynamic ?? [], {
+    dot: true,
+  })(name)
 }
 
 function buildUnsupportedApiError({
@@ -453,7 +508,7 @@ function getCodeAnalyzer(params: {
           buildInfo.importLocByPath = new Map()
         }
 
-        const importedModule = node.source.value?.toString()!
+        const importedModule = node.source.value?.toString()
         buildInfo.importLocByPath.set(importedModule, {
           sourcePosition: {
             ...node.loc.start,
@@ -462,7 +517,11 @@ function getCodeAnalyzer(params: {
           sourceContent: source.toString(),
         })
 
-        if (!dev && isNodeJsModule(importedModule)) {
+        if (
+          !dev &&
+          isNodeJsModule(importedModule) &&
+          !SUPPORTED_NATIVE_MODULES.includes(importedModule)
+        ) {
           compilation.warnings.push(
             buildWebpackError({
               message: `A Node.js module is loaded ('${importedModule}' at line ${node.loc.start.line}) which is not supported in the Edge Runtime.
@@ -524,9 +583,12 @@ function getExtractMetadata(params: {
         continue
       }
       const entryDependency = entry.dependencies?.[0]
-      const { rootDir, route } = getModuleBuildInfo(
+      const resolvedModule =
         compilation.moduleGraph.getResolvedModule(entryDependency)
-      )
+      if (!resolvedModule) {
+        continue
+      }
+      const { rootDir, route } = getModuleBuildInfo(resolvedModule)
 
       const { moduleGraph } = compilation
       const modules = new Set<webpack.NormalModule>()
@@ -570,7 +632,7 @@ function getExtractMetadata(params: {
           const resource = module.resource
           const hasOGImageGeneration =
             resource &&
-            /[\\/]node_modules[\\/]@vercel[\\/]og[\\/]dist[\\/]index\.(edge|node)\.js$|[\\/]next[\\/]dist[\\/](esm[\\/])?server[\\/]web[\\/]spec-extension[\\/]image-response\.js$/.test(
+            /[\\/]node_modules[\\/]@vercel[\\/]og[\\/]dist[\\/]index\.(edge|node)\.js$|[\\/]next[\\/]dist[\\/](esm[\\/])?server[\\/]og[\\/]image-response\.js$/.test(
               resource
             )
 
@@ -599,7 +661,7 @@ function getExtractMetadata(params: {
           if (/node_modules[\\/]regenerator-runtime[\\/]runtime\.js/.test(id)) {
             continue
           }
-          if (route?.middlewareConfig?.unstable_allowDynamicGlobs) {
+          if (route?.middlewareConfig?.unstable_allowDynamic) {
             telemetry?.record({
               eventName: 'NEXT_EDGE_ALLOW_DYNAMIC_USED',
               payload: {
@@ -619,18 +681,20 @@ function getExtractMetadata(params: {
               rootDir
             )
           ) {
+            const message = `Dynamic Code Evaluation (e. g. 'eval', 'new Function', 'WebAssembly.compile') not allowed in Edge Runtime ${
+              typeof buildInfo.usingIndirectEval !== 'boolean'
+                ? `\nUsed by ${Array.from(buildInfo.usingIndirectEval).join(
+                    ', '
+                  )}`
+                : ''
+            }\nLearn More: https://nextjs.org/docs/messages/edge-dynamic-code-evaluation`
             compilation.errors.push(
-              buildWebpackError({
-                message: `Dynamic Code Evaluation (e. g. 'eval', 'new Function', 'WebAssembly.compile') not allowed in Edge Runtime ${
-                  typeof buildInfo.usingIndirectEval !== 'boolean'
-                    ? `\nUsed by ${Array.from(buildInfo.usingIndirectEval).join(
-                        ', '
-                      )}`
-                    : ''
-                }\nLearn More: https://nextjs.org/docs/messages/edge-dynamic-code-evaluation`,
-                entryModule: module,
+              getDynamicCodeEvaluationError(
+                message,
+                module,
                 compilation,
-              })
+                compiler
+              )
             )
           }
         }
@@ -669,7 +733,7 @@ function getExtractMetadata(params: {
          * Append to the list of modules to process outgoingConnections from
          * the module that is being processed.
          */
-        for (const conn of moduleGraph.getOutgoingConnections(module)) {
+        for (const conn of getModuleReferencesInOrder(module, moduleGraph)) {
           if (conn.module) {
             modules.add(conn.module as webpack.NormalModule)
           }
@@ -687,13 +751,33 @@ function getExtractMetadata(params: {
     }
   }
 }
-export default class MiddlewarePlugin {
-  private readonly dev: boolean
-  private readonly sriEnabled: boolean
 
-  constructor({ dev, sriEnabled }: { dev: boolean; sriEnabled: boolean }) {
+// These values will be replaced again in edge runtime deployment build.
+// `buildId` represents BUILD_ID to be externalized in env vars.
+// `encryptionKey` represents server action encryption key to be externalized in env vars.
+type EdgeRuntimeEnvironments = Record<string, string> & {
+  __NEXT_BUILD_ID: string
+  NEXT_SERVER_ACTIONS_ENCRYPTION_KEY: string
+}
+
+interface Options {
+  dev: boolean
+  sriEnabled: boolean
+  rewrites: CustomRoutes['rewrites']
+  edgeEnvironments: EdgeRuntimeEnvironments
+}
+
+export default class MiddlewarePlugin {
+  private readonly dev: Options['dev']
+  private readonly sriEnabled: Options['sriEnabled']
+  private readonly rewrites: Options['rewrites']
+  private readonly edgeEnvironments: EdgeRuntimeEnvironments
+
+  constructor({ dev, sriEnabled, rewrites, edgeEnvironments }: Options) {
     this.dev = dev
     this.sriEnabled = sriEnabled
+    this.rewrites = rewrites
+    this.edgeEnvironments = edgeEnvironments
   }
 
   public apply(compiler: webpack.Compiler) {
@@ -707,9 +791,13 @@ export default class MiddlewarePlugin {
         compiler,
         compilation,
       })
-      hooks.parser.for('javascript/auto').tap(NAME, codeAnalyzer)
-      hooks.parser.for('javascript/dynamic').tap(NAME, codeAnalyzer)
-      hooks.parser.for('javascript/esm').tap(NAME, codeAnalyzer)
+
+      // parser hooks aren't available in rspack
+      if (!process.env.NEXT_RSPACK) {
+        hooks.parser.for('javascript/auto').tap(NAME, codeAnalyzer)
+        hooks.parser.for('javascript/dynamic').tap(NAME, codeAnalyzer)
+        hooks.parser.for('javascript/esm').tap(NAME, codeAnalyzer)
+      }
 
       /**
        * Extract all metadata for the entry points in a Map object.
@@ -738,6 +826,9 @@ export default class MiddlewarePlugin {
           metadataByEntry,
           opts: {
             sriEnabled: this.sriEnabled,
+            rewrites: this.rewrites,
+            edgeEnvironments: this.edgeEnvironments,
+            dev: this.dev,
           },
         })
       )
@@ -776,7 +867,8 @@ export async function handleWebpackExternalForEdgeRuntime({
   getResolve: () => any
 }) {
   if (
-    contextInfo.issuerLayer === 'middleware' &&
+    (contextInfo.issuerLayer === WEBPACK_LAYERS.middleware ||
+      contextInfo.issuerLayer === WEBPACK_LAYERS.api) &&
     isNodeJsModule(request) &&
     !supportedEdgePolyfills.has(request)
   ) {
@@ -784,7 +876,7 @@ export async function handleWebpackExternalForEdgeRuntime({
     try {
       await getResolve()(context, request)
     } catch {
-      return `root  globalThis.__import_unsupported('${request}')`
+      return `root globalThis.__import_unsupported('${request}')`
     }
   }
 }

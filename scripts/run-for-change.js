@@ -23,7 +23,7 @@ const CHANGE_ITEM_GROUPS = {
     'packages/eslint-plugin-next/README.md',
     'packages/next-codemod/license.md',
     'packages/next-codemod/README.md',
-    'packages/next-swc/crates/wasm/README.md',
+    'crates/wasm/README.md',
     'packages/next-swc/README.md',
     'packages/next-bundle-analyzer/readme.md',
     'packages/next-mdx/license.md',
@@ -33,9 +33,17 @@ const CHANGE_ITEM_GROUPS = {
     'packages/create-next-app/README.md',
     'packages/font/README.md',
     'packages/next-env/README.md',
+    'packages/next/src/client/components/react-dev-overlay/README.md',
   ],
   'deploy-examples': ['examples/image-component'],
-  cna: ['packages/create-next-app', 'test/integration/create-next-app'],
+  cna: [
+    'packages/create-next-app',
+    'test/integration/create-next-app',
+    'examples/basic-css',
+    'examples/mdx-pages',
+    'examples/with-sass',
+    'examples/with-eslint',
+  ],
   'next-codemod': ['packages/next-codemod'],
   'next-swc': [
     'packages/next-swc',
@@ -60,9 +68,8 @@ async function main() {
   const remoteUrl =
     eventData?.head?.repo?.full_name ||
     process.env.GITHUB_REPOSITORY ||
-    (await exec('git remote get-url origin').stdout)
+    (await exec('git remote get-url origin')).stdout
 
-  let changedFilesOutput = ''
   const isCanary =
     branchName.trim() === 'canary' && remoteUrl.includes('vercel/next.js')
 
@@ -85,7 +92,7 @@ async function main() {
     }
   )
   console.error({ branchName, remoteUrl, isCanary, changesResult })
-  changedFilesOutput = changesResult.stdout
+  const changedFilesOutput = changesResult.stdout
 
   const typeIndex = process.argv.indexOf('--type')
   const type = typeIndex > -1 && process.argv[typeIndex + 1]

@@ -1,12 +1,13 @@
-import chalk from 'next/dist/compiled/chalk'
+import type { BinaryLike } from 'crypto'
+import { bold, cyan, magenta } from '../lib/picocolors'
 import Conf from 'next/dist/compiled/conf'
-import { BinaryLike, createHash, randomBytes } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import isDockerFunction from 'next/dist/compiled/is-docker'
 import path from 'path'
 
 import { getAnonymousMeta } from './anonymous-meta'
-import * as ciEnvironment from './ci-info'
-import { _postPayload } from './post-payload'
+import * as ciEnvironment from '../server/ci-info'
+import { postNextTelemetryPayload } from './post-telemetry-payload'
 import { getRawProjectId } from './project-id'
 import { AbortController } from 'next/dist/compiled/@edge-runtime/ponyfill'
 import fs from 'fs'
@@ -29,16 +30,6 @@ const TELEMETRY_KEY_ID = `telemetry.anonymousId`
 const TELEMETRY_KEY_SALT = `telemetry.salt`
 
 export type TelemetryEvent = { eventName: string; payload: object }
-type EventContext = {
-  anonymousId: string
-  projectId: string
-  sessionId: string
-}
-type EventMeta = { [key: string]: unknown }
-type EventBatchShape = {
-  eventName: string
-  fields: object
-}
 
 type RecordObject = {
   isFulfilled: boolean
@@ -58,10 +49,11 @@ function getStorageDirectory(distDir: string): string | undefined {
 }
 
 export class Telemetry {
+  readonly sessionId: string
+
   private conf: Conf<any> | null
   private distDir: string
-  private sessionId: string
-  private rawProjectId: string
+  private loadProjectId: undefined | string | Promise<string>
   private NEXT_TELEMETRY_DISABLED: any
   private NEXT_TELEMETRY_DEBUG: any
 
@@ -84,8 +76,6 @@ export class Telemetry {
       this.conf = null
     }
     this.sessionId = randomBytes(32).toString('hex')
-    this.rawProjectId = getRawProjectId()
-
     this.queue = new Set()
 
     this.notify()
@@ -106,8 +96,8 @@ export class Telemetry {
     this.conf.set(TELEMETRY_KEY_NOTIFY_DATE, Date.now().toString())
 
     console.log(
-      `${chalk.magenta.bold(
-        'Attention'
+      `${magenta(
+        bold('Attention')
       )}: Next.js now collects completely anonymous telemetry regarding usage.`
     )
     console.log(
@@ -116,7 +106,7 @@ export class Telemetry {
     console.log(
       `You can learn more, including how to opt-out if you'd not like to participate in this anonymous program, by visiting the following URL:`
     )
-    console.log(chalk.cyan('https://nextjs.org/telemetry'))
+    console.log(cyan('https://nextjs.org/telemetry'))
     console.log()
   }
 
@@ -176,8 +166,9 @@ export class Telemetry {
     return hash.digest('hex')
   }
 
-  private get projectId(): string {
-    return this.oneWayHash(this.rawProjectId)
+  private async getProjectId(): Promise<string> {
+    this.loadProjectId = this.loadProjectId || getRawProjectId()
+    return this.oneWayHash(await this.loadProjectId)
   }
 
   record = (
@@ -270,7 +261,7 @@ export class Telemetry {
     })
   }
 
-  private submitRecord = (
+  private submitRecord = async (
     _events: TelemetryEvent | TelemetryEvent[]
   ): Promise<any> => {
     let events: TelemetryEvent[]
@@ -301,22 +292,19 @@ export class Telemetry {
       return Promise.resolve()
     }
 
-    const context: EventContext = {
-      anonymousId: this.anonymousId,
-      projectId: this.projectId,
-      sessionId: this.sessionId,
-    }
-    const meta: EventMeta = getAnonymousMeta()
     const postController = new AbortController()
-    const res = _postPayload(
-      `https://telemetry.nextjs.org/api/v1/record`,
+    const res = postNextTelemetryPayload(
       {
-        context,
-        meta,
+        context: {
+          anonymousId: this.anonymousId,
+          projectId: await this.getProjectId(),
+          sessionId: this.sessionId,
+        },
+        meta: getAnonymousMeta(),
         events: events.map(({ eventName, payload }) => ({
           eventName,
           fields: payload,
-        })) as Array<EventBatchShape>,
+        })),
       },
       postController.signal
     )

@@ -1,83 +1,96 @@
 import { existsSync } from 'fs'
 import { basename, extname, join, relative, isAbsolute, resolve } from 'path'
 import { pathToFileURL } from 'url'
-import { Agent as HttpAgent } from 'http'
-import { Agent as HttpsAgent } from 'https'
 import findUp from 'next/dist/compiled/find-up'
-import chalk from '../lib/chalk'
 import * as Log from '../build/output/log'
 import { CONFIG_FILES, PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'
-import { execOnce } from '../shared/lib/utils'
-import {
-  defaultConfig,
-  normalizeConfig,
+import { defaultConfig, normalizeConfig } from './config-shared'
+import type {
   ExperimentalConfig,
   NextConfigComplete,
-  validateConfig,
   NextConfig,
+  TurboLoaderItem,
 } from './config-shared'
+
 import { loadWebpackHook } from './config-utils'
-import { ImageConfig, imageConfigDefault } from '../shared/lib/image-config'
+import { imageConfigDefault } from '../shared/lib/image-config'
+import type { ImageConfig } from '../shared/lib/image-config'
 import { loadEnvConfig, updateInitialEnv } from '@next/env'
 import { flushAndExit } from '../telemetry/flush-and-exit'
 import { findRootDir } from '../lib/find-root'
+import { setHttpClientAndAgentOptions } from './setup-http-agent-env'
+import { pathHasPrefix } from '../shared/lib/router/utils/path-has-prefix'
+import { matchRemotePattern } from '../shared/lib/match-remote-pattern'
 
-export { DomainLocale, NextConfig, normalizeConfig } from './config-shared'
+import type { ZodError } from 'next/dist/compiled/zod'
+import { hasNextSupport } from '../server/ci-info'
+import { transpileConfig } from '../build/next-config-ts/transpile-config'
+import { dset } from '../shared/lib/dset'
+import { normalizeZodErrors } from '../shared/lib/zod'
+import { HTML_LIMITED_BOT_UA_RE_STRING } from '../shared/lib/router/utils/is-bot'
+import { findDir } from '../lib/find-pages-dir'
+import { CanaryOnlyError, isStableBuild } from '../shared/lib/canary-only'
 
-const experimentalWarning = execOnce(
-  (configFileName: string, features: string[]) => {
-    const s = features.length > 1 ? 's' : ''
-    Log.warn(
-      chalk.bold(
-        `You have enabled experimental feature${s} (${features.join(
-          ', '
-        )}) in ${configFileName}.`
-      )
-    )
-    Log.warn(
-      `Experimental features are not covered by semver, and may cause unexpected or broken application behavior. ` +
-        `Use at your own risk.`
-    )
+export { normalizeConfig } from './config-shared'
+export type { DomainLocale, NextConfig } from './config-shared'
 
-    console.warn()
+function normalizeNextConfigZodErrors(
+  error: ZodError<NextConfig>
+): [errorMessages: string[], shouldExit: boolean] {
+  let shouldExit = false
+  const issues = normalizeZodErrors(error)
+  return [
+    issues.flatMap(({ issue, message }) => {
+      if (issue.path[0] === 'images') {
+        // We exit the build when encountering an error in the images config
+        shouldExit = true
+      }
+
+      return message
+    }),
+    shouldExit,
+  ]
+}
+
+export function warnOptionHasBeenDeprecated(
+  config: NextConfig,
+  nestedPropertyKey: string,
+  reason: string,
+  silent: boolean
+): boolean {
+  let hasWarned = false
+  if (!silent) {
+    let current = config
+    let found = true
+    const nestedPropertyKeys = nestedPropertyKey.split('.')
+    for (const key of nestedPropertyKeys) {
+      if (current[key] !== undefined) {
+        current = current[key]
+      } else {
+        found = false
+        break
+      }
+    }
+    if (found) {
+      Log.warnOnce(reason)
+      hasWarned = true
+    }
   }
-)
-
-export function setHttpClientAndAgentOptions(config: {
-  httpAgentOptions?: NextConfig['httpAgentOptions']
-}) {
-  if ((globalThis as any).__NEXT_HTTP_AGENT) {
-    // We only need to assign once because we want
-    // to reuse the same agent for all requests.
-    return
-  }
-
-  if (!config) {
-    throw new Error('Expected config.httpAgentOptions to be an object')
-  }
-
-  ;(globalThis as any).__NEXT_HTTP_AGENT_OPTIONS = config.httpAgentOptions
-  ;(globalThis as any).__NEXT_HTTP_AGENT = new HttpAgent(
-    config.httpAgentOptions
-  )
-  ;(globalThis as any).__NEXT_HTTPS_AGENT = new HttpsAgent(
-    config.httpAgentOptions
-  )
+  return hasWarned
 }
 
 export function warnOptionHasBeenMovedOutOfExperimental(
   config: NextConfig,
-  oldKey: string,
+  oldExperimentalKey: string,
   newKey: string,
   configFileName: string,
-  silent = false
+  silent: boolean
 ) {
-  if (config.experimental && oldKey in config.experimental) {
+  if (config.experimental && oldExperimentalKey in config.experimental) {
     if (!silent) {
       Log.warn(
-        `\`${oldKey}\` has been moved out of \`experimental\`` +
-          (newKey.includes('.') ? ` and into \`${newKey}\`` : '') +
-          `. Please update your ${configFileName} file accordingly.`
+        `\`experimental.${oldExperimentalKey}\` has been moved to \`${newKey}\`. ` +
+          `Please update your ${configFileName} file accordingly.`
       )
     }
 
@@ -88,23 +101,50 @@ export function warnOptionHasBeenMovedOutOfExperimental(
       current[key] = current[key] || {}
       current = current[key]
     }
-    current[newKeys.shift()!] = (config.experimental as any)[oldKey]
+    current[newKeys.shift()!] = (config.experimental as any)[oldExperimentalKey]
   }
 
   return config
 }
 
+function warnCustomizedOption(
+  config: NextConfig,
+  key: string,
+  defaultValue: any,
+  customMessage: string,
+  configFileName: string,
+  silent: boolean
+) {
+  const segs = key.split('.')
+  let current = config
+
+  while (segs.length >= 1) {
+    const seg = segs.shift()!
+    if (!(seg in current)) {
+      return
+    }
+    current = current[seg]
+  }
+
+  if (!silent && current !== defaultValue) {
+    Log.warn(
+      `The "${key}" option has been modified. ${customMessage ? customMessage + '. ' : ''}It should be removed from your ${configFileName}.`
+    )
+  }
+}
+
 function assignDefaults(
   dir: string,
   userConfig: { [key: string]: any },
-  silent = false
+  silent: boolean
 ) {
   const configFileName = userConfig.configFileName
-  if (!silent && typeof userConfig.exportTrailingSlash !== 'undefined') {
-    console.warn(
-      chalk.yellow.bold('Warning: ') +
+  if (typeof userConfig.exportTrailingSlash !== 'undefined') {
+    if (!silent) {
+      Log.warn(
         `The "exportTrailingSlash" option has been renamed to "trailingSlash". Please update your ${configFileName}.`
-    )
+      )
+    }
     if (typeof userConfig.trailingSlash === 'undefined') {
       userConfig.trailingSlash = userConfig.exportTrailingSlash
     }
@@ -117,28 +157,6 @@ function assignDefaults(
 
       if (value === undefined || value === null) {
         return currentConfig
-      }
-
-      if (key === 'experimental' && typeof value === 'object') {
-        const enabledExperiments: (keyof ExperimentalConfig)[] = []
-
-        // defaultConfig.experimental is predefined and will never be undefined
-        // This is only a type guard for the typescript
-        if (defaultConfig.experimental) {
-          for (const featureName of Object.keys(
-            value
-          ) as (keyof ExperimentalConfig)[]) {
-            if (
-              value[featureName] !== defaultConfig.experimental[featureName]
-            ) {
-              enabledExperiments.push(featureName)
-            }
-          }
-        }
-
-        if (!silent && enabledExperiments.length > 0) {
-          experimentalWarning(configFileName, enabledExperiments)
-        }
       }
 
       if (key === 'distDir') {
@@ -207,7 +225,40 @@ function assignDefaults(
     {}
   )
 
+  // TODO: remove these once we've made PPR default
+  // If this was defaulted to true, it implies that the configuration was
+  // overridden for testing to be defaulted on.
+  if (defaultConfig.experimental?.ppr) {
+    Log.warn(
+      `\`experimental.ppr\` has been defaulted to \`true\` because \`__NEXT_EXPERIMENTAL_PPR\` was set to \`true\` during testing.`
+    )
+  }
+
   const result = { ...defaultConfig, ...config }
+
+  if (
+    result.experimental?.allowDevelopmentBuild &&
+    process.env.NODE_ENV !== 'development'
+  ) {
+    throw new Error(
+      `The experimental.allowDevelopmentBuild option requires NODE_ENV to be explicitly set to 'development'.`
+    )
+  }
+
+  if (isStableBuild()) {
+    // Prevents usage of certain experimental features outside of canary
+    if (result.experimental?.ppr) {
+      throw new CanaryOnlyError({ feature: 'experimental.ppr' })
+    } else if (result.experimental?.dynamicIO) {
+      throw new CanaryOnlyError({ feature: 'experimental.dynamicIO' })
+    } else if (result.experimental?.turbo?.unstablePersistentCaching) {
+      throw new CanaryOnlyError({
+        feature: 'experimental.turbo.unstablePersistentCaching',
+      })
+    } else if (result.experimental?.nodeMiddleware) {
+      throw new CanaryOnlyError({ feature: 'experimental.nodeMiddleware' })
+    }
+  }
 
   if (result.output === 'export') {
     if (result.i18n) {
@@ -215,20 +266,23 @@ function assignDefaults(
         'Specified "i18n" cannot be used with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-i18n'
       )
     }
-    if (result.rewrites) {
-      throw new Error(
-        'Specified "rewrites" cannot be used with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
-      )
-    }
-    if (result.redirects) {
-      throw new Error(
-        'Specified "redirects" cannot be used with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
-      )
-    }
-    if (result.headers) {
-      throw new Error(
-        'Specified "headers" cannot be used with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
-      )
+
+    if (!hasNextSupport) {
+      if (result.rewrites) {
+        Log.warn(
+          'Specified "rewrites" will not automatically work with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
+        )
+      }
+      if (result.redirects) {
+        Log.warn(
+          'Specified "redirects" will not automatically work with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
+        )
+      }
+      if (result.headers) {
+        Log.warn(
+          'Specified "headers" will not automatically work with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
+        )
+      }
     }
   }
 
@@ -241,25 +295,6 @@ function assignDefaults(
   if (typeof result.basePath !== 'string') {
     throw new Error(
       `Specified basePath is not a string, found type "${typeof result.basePath}"`
-    )
-  }
-
-  // TODO: remove after next minor (current v13.1.1)
-  if (Array.isArray(result.experimental?.outputFileTracingIgnores)) {
-    if (!result.experimental) {
-      result.experimental = {}
-    }
-    if (!result.experimental.outputFileTracingExcludes) {
-      result.experimental.outputFileTracingExcludes = {}
-    }
-    if (!result.experimental.outputFileTracingExcludes['**/*']) {
-      result.experimental.outputFileTracingExcludes['**/*'] = []
-    }
-    result.experimental.outputFileTracingExcludes['**/*'].push(
-      ...(result.experimental.outputFileTracingIgnores || [])
-    )
-    Log.warn(
-      `\`outputFileTracingIgnores\` has been moved to \`experimental.outputFileTracingExcludes\`. Please update your ${configFileName} file accordingly.`
     )
   }
 
@@ -302,10 +337,30 @@ function assignDefaults(
       )
     }
 
-    if (images.domains) {
-      if (!Array.isArray(images.domains)) {
+    if (images.localPatterns) {
+      if (!Array.isArray(images.localPatterns)) {
         throw new Error(
-          `Specified images.domains should be an Array received ${typeof images.domains}.\nSee more info here: https://nextjs.org/docs/messages/invalid-images-config`
+          `Specified images.localPatterns should be an Array received ${typeof images.localPatterns}.\nSee more info here: https://nextjs.org/docs/messages/invalid-images-config`
+        )
+      }
+      // avoid double-pushing the same pattern if it already exists
+      const hasMatch = images.localPatterns.some(
+        (pattern) =>
+          pattern.pathname === '/_next/static/media/**' && pattern.search === ''
+      )
+      if (!hasMatch) {
+        // static import images are automatically allowed
+        images.localPatterns.push({
+          pathname: '/_next/static/media/**',
+          search: '',
+        })
+      }
+    }
+
+    if (images.remotePatterns) {
+      if (!Array.isArray(images.remotePatterns)) {
+        throw new Error(
+          `Specified images.remotePatterns should be an Array received ${typeof images.remotePatterns}.\nSee more info here: https://nextjs.org/docs/messages/invalid-images-config`
         )
       }
 
@@ -313,7 +368,33 @@ function assignDefaults(
       // so we need to ensure _next/image allows downloading from
       // this resource
       if (config.assetPrefix?.startsWith('http')) {
-        images.domains.push(new URL(config.assetPrefix).hostname)
+        try {
+          const url = new URL(config.assetPrefix)
+          const hasMatchForAssetPrefix = images.remotePatterns.some((pattern) =>
+            matchRemotePattern(pattern, url)
+          )
+
+          // avoid double-pushing the same pattern if it already can be matched
+          if (!hasMatchForAssetPrefix) {
+            images.remotePatterns.push({
+              hostname: url.hostname,
+              protocol: url.protocol.replace(/:$/, '') as 'http' | 'https',
+              port: url.port,
+            })
+          }
+        } catch (error) {
+          throw new Error(
+            `Invalid assetPrefix provided. Original error: ${error}`
+          )
+        }
+      }
+    }
+
+    if (images.domains) {
+      if (!Array.isArray(images.domains)) {
+        throw new Error(
+          `Specified images.domains should be an Array received ${typeof images.domains}.\nSee more info here: https://nextjs.org/docs/messages/invalid-images-config`
+        )
       }
     }
 
@@ -331,19 +412,21 @@ function assignDefaults(
       )
     }
 
-    if (images.path === imageConfigDefault.path && result.basePath) {
+    if (
+      images.path === imageConfigDefault.path &&
+      result.basePath &&
+      !pathHasPrefix(images.path, result.basePath)
+    ) {
       images.path = `${result.basePath}${images.path}`
     }
 
     // Append trailing slash for non-default loaders and when trailingSlash is set
-    if (images.path) {
-      if (
-        (images.loader !== 'default' &&
-          images.path[images.path.length - 1] !== '/') ||
-        result.trailingSlash
-      ) {
-        images.path += '/'
-      }
+    if (
+      images.path &&
+      !images.path.endsWith('/') &&
+      (images.loader !== 'default' || result.trailingSlash)
+    ) {
+      images.path += '/'
     }
 
     if (images.loaderFile) {
@@ -358,11 +441,79 @@ function assignDefaults(
           `Specified images.loaderFile does not exist at "${absolutePath}".`
         )
       }
-      images.loader = 'custom'
       images.loaderFile = absolutePath
     }
   }
 
+  warnCustomizedOption(
+    result,
+    'experimental.esmExternals',
+    true,
+    'experimental.esmExternals is not recommended to be modified as it may disrupt module resolution',
+    configFileName,
+    silent
+  )
+
+  warnOptionHasBeenDeprecated(
+    result,
+    'experimental.instrumentationHook',
+    `\`experimental.instrumentationHook\` is no longer needed, because \`instrumentation.js\` is available by default. You can remove it from ${configFileName}.`,
+    silent
+  )
+
+  warnOptionHasBeenDeprecated(
+    result,
+    'experimental.after',
+    `\`experimental.after\` is no longer needed, because \`after\` is available by default. You can remove it from ${configFileName}.`,
+    silent
+  )
+
+  warnOptionHasBeenDeprecated(
+    result,
+    'devIndicators.appIsrStatus',
+    `\`devIndicators.appIsrStatus\` is deprecated and no longer configurable. Please remove it from ${configFileName}.`,
+    silent
+  )
+
+  warnOptionHasBeenDeprecated(
+    result,
+    'devIndicators.buildActivity',
+    `\`devIndicators.buildActivity\` is deprecated and no longer configurable. Please remove it from ${configFileName}.`,
+    silent
+  )
+
+  const hasWarnedBuildActivityPosition = warnOptionHasBeenDeprecated(
+    result,
+    'devIndicators.buildActivityPosition',
+    `\`devIndicators.buildActivityPosition\` has been renamed to \`devIndicators.position\`. Please update your ${configFileName} file accordingly.`,
+    silent
+  )
+  if (
+    hasWarnedBuildActivityPosition &&
+    result.devIndicators !== false &&
+    result.devIndicators?.buildActivityPosition &&
+    result.devIndicators.buildActivityPosition !== result.devIndicators.position
+  ) {
+    Log.warnOnce(
+      `The \`devIndicators\` option \`buildActivityPosition\` ("${result.devIndicators.buildActivityPosition}") conflicts with \`position\` ("${result.devIndicators.position}"). Using \`buildActivityPosition\` ("${result.devIndicators.buildActivityPosition}") for backward compatibility.`
+    )
+    result.devIndicators.position = result.devIndicators.buildActivityPosition
+  }
+
+  warnOptionHasBeenMovedOutOfExperimental(
+    result,
+    'bundlePagesExternals',
+    'bundlePagesRouterDependencies',
+    configFileName,
+    silent
+  )
+  warnOptionHasBeenMovedOutOfExperimental(
+    result,
+    'serverComponentsExternalPackages',
+    'serverExternalPackages',
+    configFileName,
+    silent
+  )
   warnOptionHasBeenMovedOutOfExperimental(
     result,
     'relay',
@@ -398,14 +549,34 @@ function assignDefaults(
     configFileName,
     silent
   )
-
-  if (typeof result.experimental?.swcMinifyDebugOptions !== 'undefined') {
-    if (!silent) {
-      Log.warn(
-        'SWC minify debug option is not supported anymore, please remove it from your config.'
-      )
-    }
-  }
+  warnOptionHasBeenMovedOutOfExperimental(
+    result,
+    'swrDelta',
+    'expireTime',
+    configFileName,
+    silent
+  )
+  warnOptionHasBeenMovedOutOfExperimental(
+    result,
+    'outputFileTracingRoot',
+    'outputFileTracingRoot',
+    configFileName,
+    silent
+  )
+  warnOptionHasBeenMovedOutOfExperimental(
+    result,
+    'outputFileTracingIncludes',
+    'outputFileTracingIncludes',
+    configFileName,
+    silent
+  )
+  warnOptionHasBeenMovedOutOfExperimental(
+    result,
+    'outputFileTracingExcludes',
+    'outputFileTracingExcludes',
+    configFileName,
+    silent
+  )
 
   if ((result.experimental as any).outputStandalone) {
     if (!silent) {
@@ -416,6 +587,19 @@ function assignDefaults(
     result.output = 'standalone'
   }
 
+  if (
+    typeof result.experimental?.serverActions?.bodySizeLimit !== 'undefined'
+  ) {
+    const value = parseInt(
+      result.experimental.serverActions?.bodySizeLimit.toString()
+    )
+    if (isNaN(value) || value < 1) {
+      throw new Error(
+        'Server Actions Size Limit must be a valid number or filesize format larger than 1MB: https://nextjs.org/docs/app/api-reference/next-config-js/serverActions#bodysizelimit'
+      )
+    }
+  }
+
   warnOptionHasBeenMovedOutOfExperimental(
     result,
     'transpilePackages',
@@ -439,63 +623,73 @@ function assignDefaults(
   )
 
   if (
-    typeof userConfig.experimental?.clientRouterFilter === 'undefined' &&
-    result.experimental?.appDir
+    result?.outputFileTracingRoot &&
+    !isAbsolute(result.outputFileTracingRoot)
   ) {
-    result.experimental.clientRouterFilter = true
+    result.outputFileTracingRoot = resolve(result.outputFileTracingRoot)
+    if (!silent) {
+      Log.warn(
+        `outputFileTracingRoot should be absolute, using: ${result.outputFileTracingRoot}`
+      )
+    }
   }
 
   if (
-    result.experimental?.outputFileTracingRoot &&
-    !isAbsolute(result.experimental.outputFileTracingRoot)
+    result?.experimental?.turbo?.root &&
+    !isAbsolute(result.experimental.turbo.root)
   ) {
-    result.experimental.outputFileTracingRoot = resolve(
-      result.experimental.outputFileTracingRoot
-    )
+    result.experimental.turbo.root = resolve(result.experimental.turbo.root)
     if (!silent) {
       Log.warn(
-        `experimental.outputFileTracingRoot should be absolute, using: ${result.experimental.outputFileTracingRoot}`
+        `experimental.turbo.root should be absolute, using: ${result.experimental.turbo.root}`
       )
     }
   }
 
   // only leverage deploymentId
-  if (result.experimental?.useDeploymentId && process.env.NEXT_DEPLOYMENT_ID) {
-    if (!result.experimental) {
-      result.experimental = {}
-    }
-    result.experimental.deploymentId = process.env.NEXT_DEPLOYMENT_ID
+  if (process.env.NEXT_DEPLOYMENT_ID) {
+    result.deploymentId = process.env.NEXT_DEPLOYMENT_ID
+  }
+
+  if (result?.outputFileTracingRoot && !result?.experimental?.turbo?.root) {
+    dset(
+      result,
+      ['experimental', 'turbo', 'root'],
+      result.outputFileTracingRoot
+    )
   }
 
   // use the closest lockfile as tracing root
-  if (!result.experimental?.outputFileTracingRoot) {
+  if (!result?.outputFileTracingRoot || !result?.experimental?.turbo?.root) {
     let rootDir = findRootDir(dir)
 
     if (rootDir) {
-      if (!result.experimental) {
-        result.experimental = {}
+      if (!result?.outputFileTracingRoot) {
+        result.outputFileTracingRoot = rootDir
+        defaultConfig.outputFileTracingRoot = result.outputFileTracingRoot
       }
-      if (!defaultConfig.experimental) {
-        defaultConfig.experimental = {}
-      }
-      result.experimental.outputFileTracingRoot = rootDir
-      defaultConfig.experimental.outputFileTracingRoot =
-        result.experimental.outputFileTracingRoot
-    }
-  }
 
-  if (result.output === 'standalone' && !result.outputFileTracing) {
-    if (!silent) {
-      Log.warn(
-        `"output: 'standalone'" requires outputFileTracing not be disabled please enable it to leverage the standalone build`
-      )
+      if (!result?.experimental?.turbo?.root) {
+        dset(result, ['experimental', 'turbo', 'root'], rootDir)
+        dset(defaultConfig, ['experimental', 'turbo', 'root'], rootDir)
+      }
     }
-    result.output = undefined
   }
 
   setHttpClientAndAgentOptions(result || defaultConfig)
 
   if (result.i18n) {
+    const hasAppDir = Boolean(findDir(dir, 'app'))
+
+    if (hasAppDir) {
+      warnOptionHasBeenDeprecated(
+        result,
+        'i18n',
+        `i18n configuration in ${configFileName} is unsupported in App Router.\nLearn more about internationalization in App Router: https://nextjs.org/docs/app/building-your-application/routing/internationalization`,
+        silent
+      )
+    }
+
     const { i18n } = result
     const i18nType = typeof i18n
 
@@ -655,8 +849,8 @@ function assignDefaults(
     }
   }
 
-  if (result.devIndicators?.buildActivityPosition) {
-    const { buildActivityPosition } = result.devIndicators
+  if (result.devIndicators !== false && result.devIndicators?.position) {
+    const { position } = result.devIndicators
     const allowedValues = [
       'top-left',
       'top-right',
@@ -664,13 +858,212 @@ function assignDefaults(
       'bottom-right',
     ]
 
-    if (!allowedValues.includes(buildActivityPosition)) {
+    if (!allowedValues.includes(position)) {
       throw new Error(
-        `Invalid "devIndicator.buildActivityPosition" provided, expected one of ${allowedValues.join(
+        `Invalid "devIndicator.position" provided, expected one of ${allowedValues.join(
           ', '
-        )}, received ${buildActivityPosition}`
+        )}, received ${position}`
       )
     }
+  }
+
+  if (result.experimental) {
+    result.experimental.cacheLife = {
+      ...defaultConfig.experimental?.cacheLife,
+      ...result.experimental.cacheLife,
+    }
+    const defaultDefault = defaultConfig.experimental?.cacheLife?.['default']
+    if (
+      !defaultDefault ||
+      defaultDefault.revalidate === undefined ||
+      defaultDefault.expire === undefined ||
+      !defaultConfig.experimental?.staleTimes?.static
+    ) {
+      throw new Error('No default cacheLife profile.')
+    }
+    const defaultCacheLifeProfile = result.experimental.cacheLife['default']
+    if (!defaultCacheLifeProfile) {
+      result.experimental.cacheLife['default'] = defaultDefault
+    } else {
+      if (defaultCacheLifeProfile.stale === undefined) {
+        const staticStaleTime = result.experimental.staleTimes?.static
+        defaultCacheLifeProfile.stale =
+          staticStaleTime ?? defaultConfig.experimental?.staleTimes?.static
+      }
+      if (defaultCacheLifeProfile.revalidate === undefined) {
+        defaultCacheLifeProfile.revalidate = defaultDefault.revalidate
+      }
+      if (defaultCacheLifeProfile.expire === undefined) {
+        defaultCacheLifeProfile.expire =
+          result.expireTime ?? defaultDefault.expire
+      }
+    }
+    // This is the most dynamic cache life profile.
+    const secondsCacheLifeProfile = result.experimental.cacheLife['seconds']
+    if (
+      secondsCacheLifeProfile &&
+      secondsCacheLifeProfile.stale === undefined
+    ) {
+      // We default this to whatever stale time you had configured for dynamic content.
+      // Since this is basically a dynamic cache life profile.
+      const dynamicStaleTime = result.experimental.staleTimes?.dynamic
+      secondsCacheLifeProfile.stale =
+        dynamicStaleTime ?? defaultConfig.experimental?.staleTimes?.dynamic
+    }
+  }
+
+  if (result.experimental?.cacheHandlers) {
+    const allowedHandlerNameRegex = /[a-z-]/
+
+    if (typeof result.experimental.cacheHandlers !== 'object') {
+      throw new Error(
+        `Invalid "experimental.cacheHandlers" provided, expected an object e.g. { default: '/my-handler.js' }, received ${JSON.stringify(result.experimental.cacheHandlers)}`
+      )
+    }
+
+    const handlerKeys = Object.keys(result.experimental.cacheHandlers)
+    const invalidHandlerItems: Array<{ key: string; reason: string }> = []
+
+    for (const key of handlerKeys) {
+      if (!allowedHandlerNameRegex.test(key)) {
+        invalidHandlerItems.push({
+          key,
+          reason: 'key must only use characters a-z and -',
+        })
+      } else {
+        const handlerPath = result.experimental.cacheHandlers[key]
+
+        if (handlerPath && !existsSync(handlerPath)) {
+          invalidHandlerItems.push({
+            key,
+            reason: `cache handler path provided does not exist, received ${handlerPath}`,
+          })
+        }
+      }
+      if (invalidHandlerItems.length) {
+        throw new Error(
+          `Invalid handler fields configured for "experimental.cacheHandler":\n${invalidHandlerItems.map((item) => `${key}: ${item.reason}`).join('\n')}`
+        )
+      }
+    }
+  }
+
+  const userProvidedModularizeImports = result.modularizeImports
+  // Unfortunately these packages end up re-exporting 10600 modules, for example: https://unpkg.com/browse/@mui/icons-material@5.11.16/esm/index.js.
+  // Leveraging modularizeImports tremendously reduces compile times for these.
+  result.modularizeImports = {
+    ...(userProvidedModularizeImports || {}),
+    // This is intentionally added after the user-provided modularizeImports config.
+    '@mui/icons-material': {
+      transform: '@mui/icons-material/{{member}}',
+    },
+    lodash: {
+      transform: 'lodash/{{member}}',
+    },
+  }
+
+  const userProvidedOptimizePackageImports =
+    result.experimental?.optimizePackageImports || []
+  if (!result.experimental) {
+    result.experimental = {}
+  }
+
+  result.experimental.optimizePackageImports = [
+    ...new Set([
+      ...userProvidedOptimizePackageImports,
+      'lucide-react',
+      'date-fns',
+      'lodash-es',
+      'ramda',
+      'antd',
+      'react-bootstrap',
+      'ahooks',
+      '@ant-design/icons',
+      '@headlessui/react',
+      '@headlessui-float/react',
+      '@heroicons/react/20/solid',
+      '@heroicons/react/24/solid',
+      '@heroicons/react/24/outline',
+      '@visx/visx',
+      '@tremor/react',
+      'rxjs',
+      '@mui/material',
+      '@mui/icons-material',
+      'recharts',
+      'react-use',
+      'effect',
+      '@effect/schema',
+      '@effect/platform',
+      '@effect/platform-node',
+      '@effect/platform-browser',
+      '@effect/platform-bun',
+      '@effect/sql',
+      '@effect/sql-mssql',
+      '@effect/sql-mysql2',
+      '@effect/sql-pg',
+      '@effect/sql-squlite-node',
+      '@effect/sql-squlite-bun',
+      '@effect/sql-squlite-wasm',
+      '@effect/sql-squlite-react-native',
+      '@effect/sql-squlite-wasm',
+      '@effect/rpc',
+      '@effect/rpc-http',
+      '@effect/typeclass',
+      '@effect/experimental',
+      '@effect/opentelemetry',
+      '@material-ui/core',
+      '@material-ui/icons',
+      '@tabler/icons-react',
+      'mui-core',
+      // We don't support wildcard imports for these configs, e.g. `react-icons/*`
+      // so we need to add them manually.
+      // In the future, we should consider automatically detecting packages that
+      // need to be optimized.
+      'react-icons/ai',
+      'react-icons/bi',
+      'react-icons/bs',
+      'react-icons/cg',
+      'react-icons/ci',
+      'react-icons/di',
+      'react-icons/fa',
+      'react-icons/fa6',
+      'react-icons/fc',
+      'react-icons/fi',
+      'react-icons/gi',
+      'react-icons/go',
+      'react-icons/gr',
+      'react-icons/hi',
+      'react-icons/hi2',
+      'react-icons/im',
+      'react-icons/io',
+      'react-icons/io5',
+      'react-icons/lia',
+      'react-icons/lib',
+      'react-icons/lu',
+      'react-icons/md',
+      'react-icons/pi',
+      'react-icons/ri',
+      'react-icons/rx',
+      'react-icons/si',
+      'react-icons/sl',
+      'react-icons/tb',
+      'react-icons/tfi',
+      'react-icons/ti',
+      'react-icons/vsc',
+      'react-icons/wi',
+    ]),
+  ]
+
+  if (!result.htmlLimitedBots) {
+    // @ts-expect-error: override the htmlLimitedBots with default string, type covert: RegExp -> string
+    result.htmlLimitedBots = HTML_LIMITED_BOT_UA_RE_STRING
+  }
+
+  // "use cache" was originally implicitly enabled with the dynamicIO flag, so
+  // we transfer the value for dynamicIO to the explicit useCache flag to ensure
+  // backwards compatibility.
+  if (result.experimental.useCache === undefined) {
+    result.experimental.useCache = result.experimental.dynamicIO
   }
 
   return result
@@ -679,10 +1072,32 @@ function assignDefaults(
 export default async function loadConfig(
   phase: string,
   dir: string,
-  customConfig?: object | null,
-  rawConfig?: boolean,
-  silent?: boolean
+  {
+    customConfig,
+    rawConfig,
+    silent = true,
+    onLoadUserConfig,
+    reactProductionProfiling,
+  }: {
+    customConfig?: object | null
+    rawConfig?: boolean
+    silent?: boolean
+    onLoadUserConfig?: (conf: NextConfig) => void
+    reactProductionProfiling?: boolean
+  } = {}
 ): Promise<NextConfigComplete> {
+  if (!process.env.__NEXT_PRIVATE_RENDER_WORKER) {
+    try {
+      loadWebpackHook()
+    } catch (err) {
+      // this can fail in standalone mode as the files
+      // aren't traced/included
+      if (!process.env.__NEXT_PRIVATE_STANDALONE_CONFIG) {
+        throw err
+      }
+    }
+  }
+
   if (process.env.__NEXT_PRIVATE_STANDALONE_CONFIG) {
     return JSON.parse(process.env.__NEXT_PRIVATE_STANDALONE_CONFIG)
   }
@@ -695,8 +1110,7 @@ export default async function loadConfig(
       }
     : Log
 
-  await loadEnvConfig(dir, phase === PHASE_DEVELOPMENT_SERVER, curLog)
-  loadWebpackHook()
+  loadEnvConfig(dir, phase === PHASE_DEVELOPMENT_SERVER, curLog)
 
   let configFileName = 'next.config.js'
 
@@ -714,11 +1128,19 @@ export default async function loadConfig(
 
   const path = await findUp(CONFIG_FILES, { cwd: dir })
 
+  if (process.env.__NEXT_TEST_MODE) {
+    if (path) {
+      Log.info(`Loading config from ${path}`)
+    } else {
+      Log.info('No config file found')
+    }
+  }
+
   // If config file was found
   if (path?.length) {
     configFileName = basename(path)
-    let userConfigModule: any
 
+    let userConfigModule: any
     try {
       const envBefore = Object.assign({}, process.env)
 
@@ -730,6 +1152,11 @@ export default async function loadConfig(
         // jest relies on so we fall back to require for this case
         // https://github.com/nodejs/node/issues/35889
         userConfigModule = require(path)
+      } else if (configFileName === 'next.config.ts') {
+        userConfigModule = await transpileConfig({
+          nextConfigPath: path,
+          cwd: dir,
+        })
       } else {
         userConfigModule = await import(pathToFileURL(path).href)
       }
@@ -746,48 +1173,50 @@ export default async function loadConfig(
         return userConfigModule
       }
     } catch (err) {
+      // TODO: Modify docs to add cases of failing next.config.ts transformation
       curLog.error(
         `Failed to load ${configFileName}, see more info here https://nextjs.org/docs/messages/next-config-error`
       )
       throw err
     }
-    const userConfig = await normalizeConfig(
+
+    const userConfig = (await normalizeConfig(
       phase,
       userConfigModule.default || userConfigModule
-    )
+    )) as NextConfig
 
-    const validateResult = validateConfig(userConfig)
+    if (!process.env.NEXT_MINIMAL) {
+      // We only validate the config against schema in non minimal mode
+      const { configSchema } =
+        require('./config-schema') as typeof import('./config-schema')
+      const state = configSchema.safeParse(userConfig)
 
-    if (!silent && validateResult.errors) {
-      // Only load @segment/ajv-human-errors when invalid config is detected
-      const { AggregateAjvError } =
-        require('next/dist/compiled/@segment/ajv-human-errors') as typeof import('next/dist/compiled/@segment/ajv-human-errors')
-      const aggregatedAjvErrors = new AggregateAjvError(validateResult.errors, {
-        fieldLabels: 'js',
-      })
+      if (state.success === false) {
+        // error message header
+        const messages = [`Invalid ${configFileName} options detected: `]
 
-      let shouldExit = false
-      let messages = [`Invalid ${configFileName} options detected: `]
-
-      for (const error of aggregatedAjvErrors) {
-        messages.push(`    ${error.message}`)
-        if (error.message.startsWith('The value at .images.')) {
-          shouldExit = true
+        const [errorMessages, shouldExit] = normalizeNextConfigZodErrors(
+          state.error
+        )
+        // ident list item
+        for (const error of errorMessages) {
+          messages.push(`    ${error}`)
         }
-      }
 
-      messages.push(
-        'See more info here: https://nextjs.org/docs/messages/invalid-next-config'
-      )
+        // error message footer
+        messages.push(
+          'See more info here: https://nextjs.org/docs/messages/invalid-next-config'
+        )
 
-      if (shouldExit) {
-        for (const message of messages) {
-          curLog.error(message)
-        }
-        await flushAndExit(1)
-      } else {
-        for (const message of messages) {
-          curLog.warn(message)
+        if (shouldExit) {
+          for (const message of messages) {
+            console.error(message)
+          }
+          await flushAndExit(1)
+        } else {
+          for (const message of messages) {
+            curLog.warn(message)
+          }
         }
       }
     }
@@ -803,11 +1232,55 @@ export default async function loadConfig(
       const { canonicalBase } = userConfig.amp || ({} as any)
       userConfig.amp = userConfig.amp || {}
       userConfig.amp.canonicalBase =
-        (canonicalBase.endsWith('/')
+        (canonicalBase?.endsWith('/')
           ? canonicalBase.slice(0, -1)
           : canonicalBase) || ''
     }
 
+    if (reactProductionProfiling) {
+      userConfig.reactProductionProfiling = reactProductionProfiling
+    }
+
+    if (
+      userConfig.experimental?.turbo?.loaders &&
+      !userConfig.experimental?.turbo?.rules
+    ) {
+      curLog.warn(
+        'experimental.turbo.loaders is now deprecated. Please update next.config.js to use experimental.turbo.rules as soon as possible.\n' +
+          'The new option is similar, but the key should be a glob instead of an extension.\n' +
+          'Example: loaders: { ".mdx": ["mdx-loader"] } -> rules: { "*.mdx": ["mdx-loader"] }" }\n' +
+          'See more info here https://nextjs.org/docs/app/api-reference/next-config-js/turbo'
+      )
+
+      const rules: Record<string, TurboLoaderItem[]> = {}
+      for (const [ext, loaders] of Object.entries(
+        userConfig.experimental.turbo.loaders
+      )) {
+        rules['*' + ext] = loaders as TurboLoaderItem[]
+      }
+
+      userConfig.experimental.turbo.rules = rules
+    }
+
+    if (userConfig.experimental?.useLightningcss) {
+      const { loadBindings } = require('next/dist/build/swc')
+      const isLightningSupported = (await loadBindings())?.css?.lightning
+
+      if (!isLightningSupported) {
+        curLog.warn(
+          `experimental.useLightningcss is set, but the setting is disabled because next-swc/wasm does not support it yet.`
+        )
+        userConfig.experimental.useLightningcss = false
+      }
+    }
+
+    // serialize the regex config into string
+    if (userConfig?.htmlLimitedBots instanceof RegExp) {
+      // @ts-expect-error: override the htmlLimitedBots with default string, type covert: RegExp -> string
+      userConfig.htmlLimitedBots = userConfig.htmlLimitedBots.source
+    }
+
+    onLoadUserConfig?.(userConfig)
     const completeConfig = assignDefaults(
       dir,
       {
@@ -821,20 +1294,22 @@ export default async function loadConfig(
     return completeConfig
   } else {
     const configBaseName = basename(CONFIG_FILES[0], extname(CONFIG_FILES[0]))
-    const nonJsPath = findUp.sync(
+    const unsupportedConfig = findUp.sync(
       [
-        `${configBaseName}.jsx`,
-        `${configBaseName}.ts`,
-        `${configBaseName}.tsx`,
+        `${configBaseName}.cjs`,
+        `${configBaseName}.cts`,
+        `${configBaseName}.mts`,
         `${configBaseName}.json`,
+        `${configBaseName}.jsx`,
+        `${configBaseName}.tsx`,
       ],
       { cwd: dir }
     )
-    if (nonJsPath?.length) {
+    if (unsupportedConfig?.length) {
       throw new Error(
         `Configuring Next.js via '${basename(
-          nonJsPath
-        )}' is not supported. Please replace the file with 'next.config.js' or 'next.config.mjs'.`
+          unsupportedConfig
+        )}' is not supported. Please replace the file with 'next.config.js', 'next.config.mjs', or 'next.config.ts'.`
       )
     }
   }
@@ -849,4 +1324,48 @@ export default async function loadConfig(
   completeConfig.configFileName = configFileName
   setHttpClientAndAgentOptions(completeConfig)
   return completeConfig
+}
+
+export type ConfiguredExperimentalFeature =
+  | { name: keyof ExperimentalConfig; type: 'boolean'; value: boolean }
+  | { name: keyof ExperimentalConfig; type: 'number'; value: number }
+  | { name: keyof ExperimentalConfig; type: 'other' }
+
+export function getConfiguredExperimentalFeatures(
+  userNextConfigExperimental: NextConfig['experimental']
+) {
+  const configuredExperimentalFeatures: ConfiguredExperimentalFeature[] = []
+
+  if (!userNextConfigExperimental) {
+    return configuredExperimentalFeatures
+  }
+
+  // defaultConfig.experimental is predefined and will never be undefined
+  // This is only a type guard for the typescript
+  if (defaultConfig.experimental) {
+    for (const name of Object.keys(
+      userNextConfigExperimental
+    ) as (keyof ExperimentalConfig)[]) {
+      const value = userNextConfigExperimental[name]
+
+      if (name === 'turbo' && !process.env.TURBOPACK) {
+        // Ignore any Turbopack config if Turbopack is not enabled
+        continue
+      }
+
+      if (
+        name in defaultConfig.experimental &&
+        value !== defaultConfig.experimental[name]
+      ) {
+        configuredExperimentalFeatures.push(
+          typeof value === 'boolean'
+            ? { name, type: 'boolean', value }
+            : typeof value === 'number'
+              ? { name, type: 'number', value }
+              : { name, type: 'other' }
+        )
+      }
+    }
+  }
+  return configuredExperimentalFeatures
 }
